@@ -35,12 +35,14 @@ def fp8_linear(x, weight_fp8, weight_scale, bias=None):
     x_scale = (x_amax / 448.0).clamp(min=1e-12)
     x_fp8 = (x_2d / x_scale).to(torch.float8_e4m3fn)
 
-    out = torch._scaled_mm(
+    result = torch._scaled_mm(
         x_fp8, weight_fp8.t(),
         scale_a=x_scale.float().view(1),
         scale_b=weight_scale,
         out_dtype=torch.bfloat16
     )
+    # torch._scaled_mm returns (tensor, amax) tuple in some versions
+    out = result[0] if isinstance(result, tuple) else result
 
     if bias is not None:
         out = out + bias
