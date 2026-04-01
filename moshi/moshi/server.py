@@ -41,6 +41,7 @@ from aiohttp import web
 from huggingface_hub import hf_hub_download
 import numpy as np
 import sentencepiece
+import soundfile as sf
 import sphn
 import torch
 import random
@@ -91,6 +92,27 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+def load_audio(audio_file: str, target_sr: int) -> torch.Tensor:
+    """Load and preprocess audio file for model conditioning.
+
+    Returns tensor of shape [1, 1, time] at target sample rate.
+    """
+    pcm, sr = sf.read(audio_file)
+    pcm = torch.from_numpy(pcm).float()
+    if pcm.ndim == 1:
+        pcm = pcm.unsqueeze(0)
+    else:
+        pcm = pcm.transpose(0, 1)
+    if sr != target_sr:
+        new_length = int(pcm.shape[-1] * target_sr / sr)
+        pcm = torch.nn.functional.interpolate(
+            pcm.unsqueeze(0), size=new_length, mode='linear'
+        ).squeeze(0)
+    if pcm.shape[0] > 1:
+        pcm = pcm.mean(dim=0, keepdim=True)
+    return pcm.unsqueeze(0)  # [1, 1, time]
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -101,13 +123,21 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False, fp8: bool = False):
+                 save_voice_prompt_embeddings: bool = False, fp8: bool = False,
+                 initial_audio_file: str | None = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self._fp8 = fp8
+
+        # Load initial audio for model conditioning (primes LM hidden state)
+        self.initial_pcm = None
+        if initial_audio_file and os.path.isfile(initial_audio_file):
+            self.initial_pcm = load_audio(initial_audio_file, int(mimi.sample_rate))
+            logger.info(f"Loaded conditioning audio: {initial_audio_file} "
+                        f"({self.initial_pcm.shape[-1] / mimi.sample_rate:.1f}s)")
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -141,6 +171,27 @@ class ServerState:
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
 
+    def condition_on_audio(self):
+        """Pre-condition the model on initial audio.
+
+        Encodes the audio through Mimi and steps through the LM, priming its
+        hidden state. Output tokens are discarded — only the state matters.
+        This gives the model conversational context beyond the text_prompt.
+        """
+        if self.initial_pcm is None:
+            return
+        input_dtype = torch.float16 if self._fp8 else torch.float32
+        chunks = [
+            chunk for chunk in self.initial_pcm.split(self.frame_size, dim=2)
+            if chunk.shape[-1] == self.frame_size
+        ]
+        for chunk in chunks:
+            chunk = chunk.to(device=self.device, dtype=input_dtype)
+            codes = self.mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                _ = self.lm_gen.step(codes[:, :, c: c + 1])
+        logger.info(f"Conditioned on {len(chunks)} audio frames "
+                     f"({len(chunks) * self.frame_size / self.mimi.sample_rate:.1f}s)")
 
     async def handle_chat(self, request):
         ws = web.WebSocketResponse()
@@ -179,6 +230,9 @@ class ServerState:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
+
+        # Pre-condition on initial audio (primes LM hidden state)
+        self.condition_on_audio()
 
         async def recv_loop():
             nonlocal close
@@ -472,6 +526,13 @@ def main():
         action="store_true",
         help="Quantize LM weights to FP8 for ~1.5x faster inference (requires SM >= 89)"
     )
+    parser.add_argument(
+        "--initial-audio",
+        type=str,
+        default=None,
+        help="Path to audio file (WAV) to condition the model on before each conversation. "
+             "Primes the LM hidden state with conversational context/style from the audio."
+    )
 
     args = parser.parse_args()
 
@@ -558,6 +619,7 @@ def main():
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
         fp8=args.fp8,
+        initial_audio_file=args.initial_audio,
     )
     logger.info("warming up the model")
     state.warmup()
