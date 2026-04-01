@@ -199,7 +199,11 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
-                        opus_reader.append_bytes(payload)
+                        try:
+                            opus_reader.append_bytes(payload)
+                        except ValueError:
+                            # sphn channel may close after opus_loop error — safe to skip
+                            pass
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -213,8 +217,13 @@ class ServerState:
                 if close:
                     return
                 await asyncio.sleep(0.001)
-                pcm = opus_reader.read_pcm()
-                if pcm.shape[-1] == 0:
+                try:
+                    pcm = opus_reader.read_pcm()
+                except Exception:
+                    # sphn may raise on closed/corrupted channel
+                    await asyncio.sleep(0.01)
+                    continue
+                if pcm is None or pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
                     all_pcm_data = pcm
