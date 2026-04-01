@@ -241,6 +241,10 @@ class ServerState:
         _token_count = 0
         _audio_out_count = 0
 
+        # Raw PCM buffer — receives PCM float32 directly from programmatic clients
+        # (bypasses Opus encode/decode entirely, avoids sphn async compatibility issues)
+        _raw_pcm_queue = asyncio.Queue()
+
         async def recv_loop():
             nonlocal close, _recv_count
             try:
@@ -263,17 +267,24 @@ class ServerState:
                         clog.log("warning", "empty message")
                         continue
                     kind = message[0]
-                    if kind == 1:  # audio
+                    if kind == 1:  # OGG Opus audio (from browser clients)
                         payload = message[1:]
                         _recv_count += 1
                         if _diag and _recv_count <= 5:
-                            clog.log("info", f"[diag] recv audio #{_recv_count}: {len(payload)}B")
+                            clog.log("info", f"[diag] recv opus #{_recv_count}: {len(payload)}B")
                         try:
                             opus_reader.append_bytes(payload)
                         except ValueError:
                             if _diag:
                                 clog.log("warning", "[diag] opus_reader.append_bytes ValueError (closed channel)")
                             pass
+                    elif kind == 4:  # Raw PCM float32 (from programmatic clients)
+                        payload = message[1:]
+                        _recv_count += 1
+                        if _diag and _recv_count <= 5:
+                            clog.log("info", f"[diag] recv raw pcm #{_recv_count}: {len(payload)}B ({len(payload)//4} samples)")
+                        pcm = np.frombuffer(payload, dtype=np.float32)
+                        await _raw_pcm_queue.put(pcm)
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
@@ -293,11 +304,22 @@ class ServerState:
                                  f"frames={_frame_count} tokens={_token_count} audio_out={_audio_out_count}")
                     return
                 await asyncio.sleep(0.001)
+
+                # Check for raw PCM first (bypasses Opus entirely)
+                pcm = None
                 try:
-                    pcm = opus_reader.read_pcm()
-                except Exception:
-                    await asyncio.sleep(0.01)
-                    continue
+                    pcm = _raw_pcm_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                # Fall back to Opus decoder
+                if pcm is None:
+                    try:
+                        pcm = opus_reader.read_pcm()
+                    except Exception:
+                        await asyncio.sleep(0.01)
+                        continue
+
                 if pcm is None or pcm.shape[-1] == 0:
                     continue
                 _pcm_total += pcm.shape[-1]
