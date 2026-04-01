@@ -346,7 +346,7 @@ class ServerState:
                         _token_count += 1
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        pcm_cpu = main_pcm[0, 0].cpu()
+                        pcm_cpu = main_pcm[0, 0].float().cpu()  # Ensure float32 (FP8/FP16 Mimi outputs float16)
                         opus_writer.append_pcm(pcm_cpu.numpy())
                         _audio_out_count += 1
                         if _diag and _audio_out_count <= 3:
