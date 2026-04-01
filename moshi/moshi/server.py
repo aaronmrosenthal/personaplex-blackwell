@@ -234,8 +234,15 @@ class ServerState:
         # Pre-condition on initial audio (primes LM hidden state)
         self.condition_on_audio()
 
+        _diag = os.environ.get("PP_DIAG", "0") == "1"
+        _recv_count = 0
+        _pcm_total = 0
+        _frame_count = 0
+        _token_count = 0
+        _audio_out_count = 0
+
         async def recv_loop():
-            nonlocal close
+            nonlocal close, _recv_count
             try:
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.ERROR:
@@ -258,54 +265,71 @@ class ServerState:
                     kind = message[0]
                     if kind == 1:  # audio
                         payload = message[1:]
+                        _recv_count += 1
+                        if _diag and _recv_count <= 5:
+                            clog.log("info", f"[diag] recv audio #{_recv_count}: {len(payload)}B")
                         try:
                             opus_reader.append_bytes(payload)
                         except ValueError:
-                            # sphn channel may close after opus_loop error — safe to skip
+                            if _diag:
+                                clog.log("warning", "[diag] opus_reader.append_bytes ValueError (closed channel)")
                             pass
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
                 close = True
+                if _diag:
+                    clog.log("info", f"[diag] recv_loop done: {_recv_count} audio messages received")
                 clog.log("info", "connection closed")
 
         async def opus_loop():
+            nonlocal _pcm_total, _frame_count, _token_count, _audio_out_count
             all_pcm_data = None
 
             while True:
                 if close:
+                    if _diag:
+                        clog.log("info", f"[diag] opus_loop done: pcm_decoded={_pcm_total} "
+                                 f"frames={_frame_count} tokens={_token_count} audio_out={_audio_out_count}")
                     return
                 await asyncio.sleep(0.001)
                 try:
                     pcm = opus_reader.read_pcm()
                 except Exception:
-                    # sphn may raise on closed/corrupted channel
                     await asyncio.sleep(0.01)
                     continue
                 if pcm is None or pcm.shape[-1] == 0:
                     continue
+                _pcm_total += pcm.shape[-1]
+                if _diag and _pcm_total <= self.frame_size * 3:
+                    clog.log("info", f"[diag] decoded pcm: {pcm.shape[-1]} samples (total {_pcm_total})")
                 if all_pcm_data is None:
                     all_pcm_data = pcm
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 _input_dtype = torch.float16 if self._fp8 else torch.float32
                 while all_pcm_data.shape[-1] >= self.frame_size:
+                    _frame_count += 1
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device, dtype=_input_dtype)[None, None]
                     codes = self.mimi.encode(chunk)
-                    # Skip other_mimi.encode — output always discarded (saves ~6ms/frame)
+                    if _diag and _frame_count <= 5:
+                        clog.log("info", f"[diag] mimi encode frame #{_frame_count}: codes shape {codes.shape}")
                     for c in range(codes.shape[-1]):
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
                             continue
+                        _token_count += 1
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        # Skip other_mimi.decode — output always discarded
-                        # Use pinned memory for non-blocking DtoH transfer
                         pcm_cpu = main_pcm[0, 0].cpu()
                         opus_writer.append_pcm(pcm_cpu.numpy())
+                        _audio_out_count += 1
+                        if _diag and _audio_out_count <= 3:
+                            clog.log("info", f"[diag] audio output #{_audio_out_count}: "
+                                     f"{pcm_cpu.shape[-1]} samples, range [{pcm_cpu.min():.3f}, {pcm_cpu.max():.3f}]")
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
